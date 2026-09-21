@@ -20,10 +20,12 @@ try:
     from zappa.middleware import ZappaWSGIMiddleware
     from zappa.wsgi import create_wsgi_request, common_log
     from zappa.utilities import merge_headers, parse_s3_url
+    from zappa.observability import get_trace_id, log_structured, timer
 except ImportError as e:  # pragma: no cover
     from .middleware import ZappaWSGIMiddleware
     from .wsgi import create_wsgi_request, common_log
     from .utilities import merge_headers, parse_s3_url
+    from .observability import get_trace_id, log_structured, timer
 
 
 # Set up logging
@@ -285,6 +287,23 @@ class LambdaHandler:
                                "2 arguments or varargs.")
         return result
 
+    def _run_function_with_timing(self, app_function, event, context,
+                                  trace_id, dispatch_type, whole_function=None):
+        """
+        Execute an app function for a routed event, emitting a
+        structured log line with the dispatch duration so slow
+        invocations can be traced across Lambda calls.
+        """
+        with timer() as dispatch_timer:
+            result = self.run_function(app_function, event, context)
+        log_structured(logging.INFO,
+                       'zappa.dispatch',
+                       trace_id=trace_id,
+                       dispatch_type=dispatch_type,
+                       function=whole_function,
+                       duration_ms=round(dispatch_timer.duration_ms, 2))
+        return result
+
     def get_function_for_aws_event(self, record):
         """
         Get the associated function to execute for a triggered AWS event
@@ -344,6 +363,10 @@ class LambdaHandler:
         """
         settings = self.settings
 
+        # Resolve the trace id for this invocation up front so that
+        # every log line emitted while serving it can be correlated.
+        trace_id = get_trace_id(event=event, context=context)
+
         # If in DEBUG mode, log all raw incoming events.
         if settings.DEBUG:
             logger.debug('Zappa Event: {}'.format(event))
@@ -365,7 +388,9 @@ class LambdaHandler:
                 app_function = self.import_module_and_get_function(whole_function)
 
                 # Execute the function!
-                return self.run_function(app_function, event, context)
+                return self._run_function_with_timing(app_function, event, context,
+                                                      trace_id, 'scheduled',
+                                                      whole_function=whole_function)
 
             # Else, let this execute as it were.
 
@@ -374,7 +399,9 @@ class LambdaHandler:
 
             whole_function = event['command']
             app_function = self.import_module_and_get_function(whole_function)
-            result = self.run_function(app_function, event, context)
+            result = self._run_function_with_timing(app_function, event, context,
+                                                    trace_id, 'async',
+                                                    whole_function=whole_function)
             print("Result of %s:" % whole_function)
             print(result)
             return result
@@ -416,7 +443,9 @@ class LambdaHandler:
             whole_function = self.get_function_for_aws_event(records[0])
             if whole_function:
                 app_function = self.import_module_and_get_function(whole_function)
-                result = self.run_function(app_function, event, context)
+                result = self._run_function_with_timing(app_function, event, context,
+                                                        trace_id, 'aws_event',
+                                                        whole_function=whole_function)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to process the triggered event.")
@@ -428,7 +457,9 @@ class LambdaHandler:
             whole_function = self.get_function_from_bot_intent_trigger(event)
             if whole_function:
                 app_function = self.import_module_and_get_function(whole_function)
-                result = self.run_function(app_function, event, context)
+                result = self._run_function_with_timing(app_function, event, context,
+                                                        trace_id, 'bot',
+                                                        whole_function=whole_function)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to process the triggered event.")
@@ -439,7 +470,9 @@ class LambdaHandler:
             whole_function = self.settings.AUTHORIZER_FUNCTION
             if whole_function:
                 app_function = self.import_module_and_get_function(whole_function)
-                policy = self.run_function(app_function, event, context)
+                policy = self._run_function_with_timing(app_function, event, context,
+                                                        trace_id, 'authorizer',
+                                                        whole_function=whole_function)
                 return policy
             else:
                 logger.error("Cannot find a function to process the authorization request.")
@@ -452,7 +485,9 @@ class LambdaHandler:
             result = event
             if whole_function:
                 app_function = self.import_module_and_get_function(whole_function)
-                result = self.run_function(app_function, event, context)
+                result = self._run_function_with_timing(app_function, event, context,
+                                                        trace_id, 'cognito',
+                                                        whole_function=whole_function)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to handle cognito trigger {}".format(triggerSource))
@@ -465,7 +500,9 @@ class LambdaHandler:
             whole_function = '{}.{}'.format(settings.APP_MODULE, settings.APP_FUNCTION)
             app_function = self.import_module_and_get_function(whole_function)
             if app_function:
-                result = self.run_function(app_function, event, context)
+                result = self._run_function_with_timing(app_function, event, context,
+                                                        trace_id, 'awslogs',
+                                                        whole_function=whole_function)
                 logger.debug("Result of %s:" % whole_function)
                 logger.debug(result)
             else:
@@ -535,9 +572,15 @@ class LambdaHandler:
                 environ['wsgi.url_scheme'] = 'https'
                 environ['lambda.context'] = context
                 environ['lambda.event'] = event
+                # Correlate the WSGI access log with this invocation.
+                environ['zappa.trace_id'] = trace_id
 
-                # Execute the application
-                with Response.from_app(self.wsgi_app, environ) as response:
+                # Execute the application, timing the WSGI call itself
+                # so slow requests can be attributed to the app.
+                with timer() as wsgi_timer:
+                    wsgi_response = Response.from_app(self.wsgi_app, environ)
+
+                with wsgi_response as response:
                     # This is the object we're going to return.
                     # Pack the WSGI response into our special dictionary.
                     zappa_returndict = dict()
@@ -574,6 +617,17 @@ class LambdaHandler:
                     response_time_ms = delta.total_seconds() * 1000
                     response.content = response.data
                     common_log(environ, response, response_time=response_time_ms)
+
+                    # Structured request log with per-phase timings,
+                    # parseable by `zappa tail`.
+                    log_structured(logging.INFO,
+                                   'zappa.request',
+                                   trace_id=trace_id,
+                                   method=event.get('httpMethod'),
+                                   path=event.get('path'),
+                                   status=response.status_code,
+                                   wsgi_duration_ms=round(wsgi_timer.duration_ms, 2),
+                                   total_duration_ms=round(response_time_ms, 2))
 
                     return zappa_returndict
         except Exception as e:  # pragma: no cover

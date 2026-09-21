@@ -8,6 +8,7 @@ Zappa core library. You may also want to look at `cli.py` and `util.py`.
 import getpass
 import glob
 import hashlib
+import functools
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from .utilities import (add_event_source, conflicts_with_a_neighbouring_module,
                         contains_python_files_or_subdirs, copytree,
                         get_topic_name, get_venv_from_python_version,
                         human_size, remove_event_source)
+from .observability import put_custom_metric
 
 
 ##
@@ -48,6 +50,29 @@ from .utilities import (add_event_source, conflicts_with_a_neighbouring_module,
 logging.basicConfig(format='%(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _timed_operation(operation_name):
+    """
+    Decorator for Zappa deployment operations. Reports the operation
+    latency and its success/failure as custom CloudWatch metrics.
+    Metric reporting never interferes with the operation itself.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            start_time = time.time()
+            success = False
+            try:
+                result = func(self, *args, **kwargs)
+                success = bool(result)
+                return result
+            finally:
+                duration_ms = (time.time() - start_time) * 1000
+                self._report_operation_metrics(operation_name, duration_ms, success)
+        return wrapper
+    return decorator
+
 
 ##
 # Policies And Template Mappings
@@ -232,6 +257,7 @@ class Zappa:
     apigateway_policy = None
     cloudwatch_log_levels = ['OFF', 'ERROR', 'INFO']
     xray_tracing = False
+    metrics_namespace = 'Zappa'
 
     ##
     # Credentials
@@ -343,6 +369,21 @@ class Zappa:
     def boto_resource(self, service, *args, **kwargs):
         """A wrapper to apply configuration options to boto resources"""
         return self.boto_session.resource(service, *args, **self.configure_boto_session_method_kwargs(service, kwargs))
+
+    def _report_operation_metrics(self, operation, duration_ms, success):
+        """
+        Report the latency and the success/failure of a deployment
+        operation as custom CloudWatch metrics. Never raises.
+        """
+        cloudwatch_client = getattr(self, 'cloudwatch', None)
+        dimensions = {'Operation': operation}
+        put_custom_metric(cloudwatch_client, 'OperationLatency', duration_ms,
+                          unit='Milliseconds', dimensions=dimensions,
+                          namespace=self.metrics_namespace)
+        put_custom_metric(cloudwatch_client,
+                          'OperationSuccess' if success else 'OperationFailure',
+                          1, unit='Count', dimensions=dimensions,
+                          namespace=self.metrics_namespace)
 
     def cache_param(self, value):
         '''Returns a troposphere Ref to a value cached as a parameter.'''
@@ -888,6 +929,7 @@ class Zappa:
     # S3
     ##
 
+    @_timed_operation('UploadToS3')
     def upload_to_s3(self, source_path, bucket_name, disable_progress=False):
         r"""
         Given a file, upload it to S3.
@@ -1094,6 +1136,7 @@ class Zappa:
 
         return resource_arn
 
+    @_timed_operation('UpdateLambdaFunction')
     def update_lambda_function(self, bucket, function_name, s3_key=None, publish=True, local_zip=None, num_revisions=None, concurrency=None):
         """
         Given a bucket and key (or a local path) of a valid Lambda-zip, a function name and a handler, update that Lambda function's code.
@@ -1753,6 +1796,7 @@ class Zappa:
         integration.Uri = uri
         method.Integration = integration
 
+    @_timed_operation('DeployApiGateway')
     def deploy_api_gateway( self,
                             api_id,
                             stage_name,

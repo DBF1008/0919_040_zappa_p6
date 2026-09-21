@@ -8,6 +8,7 @@ from werkzeug import urls
 from urllib.parse import urlencode
 
 from .utilities import merge_headers, titlecase_keys
+from .observability import get_trace_id
 
 BINARY_METHODS = [
                     "POST",
@@ -157,6 +158,10 @@ def create_wsgi_request(event_info,
         if event_info['requestContext'].get('authorizer'):
             environ['API_GATEWAY_AUTHORIZER'] = event_info['requestContext']['authorizer']
 
+        # Attach a trace id so that every log entry emitted while
+        # serving this request can be correlated across Lambda calls.
+        environ['zappa.trace_id'] = get_trace_id(event=event_info)
+
         return environ
 
 
@@ -182,6 +187,13 @@ def common_log(environ, response, response_time=None):
         formatter = ApacheFormatter(with_response_time=False)
         log_entry = formatter(response.status_code, environ,
                               len(response.content))
+
+    # Append the trace id as a `key=value` suffix. The Apache Common
+    # Log Format prefix (including the client IP) is kept intact, so
+    # `zappa tail` keeps detecting and colorizing these entries.
+    trace_id = get_trace_id(environ=environ)
+    if trace_id:
+        log_entry = '{} trace_id={}'.format(log_entry, trace_id)
 
     logger.info(log_entry)
 
