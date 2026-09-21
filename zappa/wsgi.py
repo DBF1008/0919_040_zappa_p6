@@ -8,6 +8,9 @@ from werkzeug import urls
 from urllib.parse import urlencode
 
 from .utilities import merge_headers, titlecase_keys
+from .observability import TRACE_ID_WSGI_KEY
+from .observability import build_access_log
+from .observability import extract_trace_id
 
 BINARY_METHODS = [
                     "POST",
@@ -26,6 +29,7 @@ def create_wsgi_request(event_info,
                         binary_support=False,
                         base_path=None,
                         context_header_mappings={},
+                        trace_id=None,
                         ):
         """
         Given some event_info via API Gateway,
@@ -33,6 +37,12 @@ def create_wsgi_request(event_info,
         """
         method = event_info['httpMethod']
         headers = merge_headers(event_info) or {} # Allow for the AGW console 'Test' button to work (Pull #735)
+
+        # Attach a trace id that is shared by every log line and async task
+        # spawned while servicing this request. Inbound trace headers win, so
+        # callers can continue an existing trace across services.
+        if trace_id is None:
+            trace_id = extract_trace_id(event=event_info, headers=headers)
 
         """
         API Gateway and ALB both started allowing for multi-value querystring
@@ -128,6 +138,10 @@ def create_wsgi_request(event_info,
             'wsgi.run_once': False,
         }
 
+        # Non-standard WSGI key, mirrored from the value used in structured
+        # log entries. Applications can read it to correlate outbound calls.
+        environ[TRACE_ID_WSGI_KEY] = trace_id
+
         # Input processing
         if method in ["POST", "PUT", "PATCH", "DELETE"]:
             if 'Content-Type' in headers:
@@ -160,14 +174,22 @@ def create_wsgi_request(event_info,
         return environ
 
 
-def common_log(environ, response, response_time=None):
+def common_log(environ, response, response_time=None, trace_id=None):
     """
     Given the WSGI environ and the response,
     log this event in Common Log Format.
 
+    The Apache Common Log Format line is kept at the start of the message so
+    that `zappa tail` (and `zappa tail --http`) keeps parsing it unchanged;
+    a compact JSON document with the request trace id and timing is appended
+    for structured-log consumers.
+
     """
 
     logger = logging.getLogger()
+
+    if trace_id is None:
+        trace_id = environ.get(TRACE_ID_WSGI_KEY)
 
     if response_time:
         formatter = ApacheFormatter(with_response_time=True)
@@ -183,9 +205,18 @@ def common_log(environ, response, response_time=None):
         log_entry = formatter(response.status_code, environ,
                               len(response.content))
 
-    logger.info(log_entry)
+    full_entry = build_access_log(
+        log_entry,
+        trace_id=trace_id,
+        response_time_ms=response_time,
+        status_code=response.status_code,
+        method=environ.get('REQUEST_METHOD'),
+        path=environ.get('PATH_INFO'),
+    )
 
-    return log_entry
+    logger.info(full_entry)
+
+    return full_entry
 
 
 # Related: https://github.com/Miserlou/Zappa/issues/1199

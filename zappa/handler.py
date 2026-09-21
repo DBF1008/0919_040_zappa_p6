@@ -20,10 +20,28 @@ try:
     from zappa.middleware import ZappaWSGIMiddleware
     from zappa.wsgi import create_wsgi_request, common_log
     from zappa.utilities import merge_headers, parse_s3_url
+    from zappa.observability import (
+        TRACE_ID_ENV_VAR,
+        TRACE_ID_WSGI_HTTP_HEADER,
+        DEFAULT_NAMESPACE,
+        MetricReporter,
+        Timer,
+        extract_trace_id,
+        log_event,
+    )
 except ImportError as e:  # pragma: no cover
     from .middleware import ZappaWSGIMiddleware
     from .wsgi import create_wsgi_request, common_log
     from .utilities import merge_headers, parse_s3_url
+    from .observability import (
+        TRACE_ID_ENV_VAR,
+        TRACE_ID_WSGI_HTTP_HEADER,
+        DEFAULT_NAMESPACE,
+        MetricReporter,
+        Timer,
+        extract_trace_id,
+        log_event,
+    )
 
 
 # Set up logging
@@ -48,6 +66,7 @@ class LambdaHandler:
     app_module = None
     wsgi_app = None
     trailing_slash = False
+    metric_reporter = None
 
     def __new__(cls, settings_name="zappa_settings", session=None):
         """Singleton instance to avoid repeat setup"""
@@ -147,6 +166,47 @@ class LambdaHandler:
                 self.trailing_slash = True
 
             self.wsgi_app = ZappaWSGIMiddleware(wsgi_app_function)
+
+            # Custom CloudWatch metrics + structured request logging.
+            # Reporting is disabled by default and is turned on with the
+            # METRICS_ENABLED setting; when enabled it is always best-effort
+            # and must never affect request processing.
+            metrics_enabled = bool(getattr(self.settings, 'METRICS_ENABLED', False))
+            namespace = getattr(self.settings, 'METRICS_NAMESPACE', None) or DEFAULT_NAMESPACE
+            default_dimensions = {
+                'stage': getattr(self.settings, 'API_STAGE', None),
+                'project': getattr(self.settings, 'PROJECT_NAME', None),
+                'function': os.environ.get('AWS_LAMBDA_FUNCTION_NAME'),
+            }
+            cloudwatch_client = None
+            if metrics_enabled:
+                try:
+                    boto_session = self.session or boto3.Session()
+                    cloudwatch_client = boto_session.client('cloudwatch')
+                except Exception as metric_ex:  # pragma: no cover
+                    print('Failed to initialise CloudWatch metrics client: {}'.format(metric_ex))
+
+            self.metric_reporter = MetricReporter(
+                cloudwatch_client=cloudwatch_client,
+                namespace=namespace,
+                enabled=metrics_enabled,
+                default_dimensions={k: v for k, v in default_dimensions.items() if v},
+            )
+
+    def _timed(self, name, trace_id=None, dimensions=None, extra=None):
+        """
+        Build a :class:`Timer` bound to this handler's metric reporter.
+        Timers always emit a structured log line and only publish metrics
+        when METRICS_ENABLED has turned the reporter on.
+        """
+        return Timer(
+            name,
+            reporter=self.metric_reporter,
+            dimensions=dimensions,
+            trace_id=trace_id,
+            logger=logger,
+            extra=extra,
+        )
 
     def load_remote_project_archive(self, project_zip_path):
         """
@@ -348,6 +408,15 @@ class LambdaHandler:
         if settings.DEBUG:
             logger.debug('Zappa Event: {}'.format(event))
 
+        # Resolve/propagate the request trace id. The same value is attached
+        # to every structured log entry, the WSGI environ and any async task
+        # dispatched from this invocation, so all log lines emitted while
+        # servicing one logical request can be correlated.
+        trace_id = extract_trace_id(event=event, context=context)
+        os.environ[TRACE_ID_ENV_VAR] = trace_id
+        log_event(logger, 'handler.invocation', trace_id=trace_id,
+                  event_type=type(event).__name__)
+
         # Set any API Gateway defined Stage Variables
         # as env vars
         if event.get('stageVariables'):
@@ -365,7 +434,11 @@ class LambdaHandler:
                 app_function = self.import_module_and_get_function(whole_function)
 
                 # Execute the function!
-                return self.run_function(app_function, event, context)
+                with self._timed('event.scheduled', trace_id=trace_id,
+                                 extra={'function': whole_function}):
+                    result = self.run_function(app_function, event, context)
+                self.metric_reporter.flush()
+                return result
 
             # Else, let this execute as it were.
 
@@ -373,10 +446,19 @@ class LambdaHandler:
         elif event.get('command', None):
 
             whole_function = event['command']
-            app_function = self.import_module_and_get_function(whole_function)
-            result = self.run_function(app_function, event, context)
+            # Asynchronous tasks propagate the trace id in their message so
+            # that follow-up Lambda invocations share one trace.
+            if isinstance(event, dict) and event.get('trace_id'):
+                trace_id = event['trace_id']
+                os.environ[TRACE_ID_ENV_VAR] = trace_id
+            with self._timed('event.command', trace_id=trace_id,
+                             dimensions={'route': 'command'},
+                             extra={'function': whole_function}):
+                app_function = self.import_module_and_get_function(whole_function)
+                result = self.run_function(app_function, event, context)
             print("Result of %s:" % whole_function)
             print(result)
+            self.metric_reporter.flush()
             return result
 
         # This is a direct, raw python invocation.
@@ -415,11 +497,16 @@ class LambdaHandler:
             result = None
             whole_function = self.get_function_for_aws_event(records[0])
             if whole_function:
-                app_function = self.import_module_and_get_function(whole_function)
-                result = self.run_function(app_function, event, context)
+                with self._timed('event.aws_record', trace_id=trace_id,
+                                 dimensions={'route': 'aws_event'},
+                                 extra={'function': whole_function,
+                                        'record_count': len(records)}):
+                    app_function = self.import_module_and_get_function(whole_function)
+                    result = self.run_function(app_function, event, context)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to process the triggered event.")
+            self.metric_reporter.flush()
             return result
 
         # this is an AWS-event triggered from Lex bot's intent
@@ -427,19 +514,27 @@ class LambdaHandler:
             result = None
             whole_function = self.get_function_from_bot_intent_trigger(event)
             if whole_function:
-                app_function = self.import_module_and_get_function(whole_function)
-                result = self.run_function(app_function, event, context)
+                with self._timed('event.bot_intent', trace_id=trace_id,
+                                 dimensions={'route': 'bot'},
+                                 extra={'function': whole_function}):
+                    app_function = self.import_module_and_get_function(whole_function)
+                    result = self.run_function(app_function, event, context)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to process the triggered event.")
+            self.metric_reporter.flush()
             return result
 
         # This is an API Gateway authorizer event
         elif event.get('type') == 'TOKEN':
             whole_function = self.settings.AUTHORIZER_FUNCTION
             if whole_function:
-                app_function = self.import_module_and_get_function(whole_function)
-                policy = self.run_function(app_function, event, context)
+                with self._timed('event.authorizer', trace_id=trace_id,
+                                 dimensions={'route': 'authorizer'},
+                                 extra={'function': whole_function}):
+                    app_function = self.import_module_and_get_function(whole_function)
+                    policy = self.run_function(app_function, event, context)
+                self.metric_reporter.flush()
                 return policy
             else:
                 logger.error("Cannot find a function to process the authorization request.")
@@ -451,11 +546,16 @@ class LambdaHandler:
             whole_function = self.get_function_for_cognito_trigger(triggerSource)
             result = event
             if whole_function:
-                app_function = self.import_module_and_get_function(whole_function)
-                result = self.run_function(app_function, event, context)
+                with self._timed('event.cognito_trigger', trace_id=trace_id,
+                                 dimensions={'route': 'cognito'},
+                                 extra={'function': whole_function,
+                                        'trigger_source': triggerSource}):
+                    app_function = self.import_module_and_get_function(whole_function)
+                    result = self.run_function(app_function, event, context)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to handle cognito trigger {}".format(triggerSource))
+            self.metric_reporter.flush()
             return result
 
         # This is a CloudWatch event
@@ -463,13 +563,20 @@ class LambdaHandler:
         elif event.get('awslogs', None):
             result = None
             whole_function = '{}.{}'.format(settings.APP_MODULE, settings.APP_FUNCTION)
-            app_function = self.import_module_and_get_function(whole_function)
+            with self._timed('event.cloudwatch_logs', trace_id=trace_id,
+                             dimensions={'route': 'awslogs'},
+                             extra={'function': whole_function}):
+                app_function = self.import_module_and_get_function(whole_function)
+                if app_function:
+                    result = self.run_function(app_function, event, context)
+                else:
+                    app_function = None
             if app_function:
-                result = self.run_function(app_function, event, context)
                 logger.debug("Result of %s:" % whole_function)
                 logger.debug(result)
             else:
                 logger.error("Cannot find a function to process the triggered event.")
+            self.metric_reporter.flush()
             return result
 
         # Normal web app flow
@@ -482,62 +589,84 @@ class LambdaHandler:
                 script_name = ''
                 is_elb_context = False
                 headers = merge_headers(event)
-                if event.get('requestContext', None) and event['requestContext'].get('elb', None):
-                    # Related: https://github.com/Miserlou/Zappa/issues/1715
-                    # inputs/outputs for lambda loadbalancer
-                    # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/lambda-functions.html
-                    is_elb_context = True
-                    # host is lower-case when forwarded from ELB
-                    host = headers.get('host')
-                    # TODO: pathParameters is a first-class citizen in apigateway but not available without
-                    # some parsing work for ELB (is this parameter used for anything?)
-                    event['pathParameters'] = ''
-                else:
-                    if headers:
-                        host = headers.get('Host')
+                route_timer = self._timed(
+                    'event.route', trace_id=trace_id,
+                    dimensions={'route': 'http'},
+                    extra={'method': event.get('httpMethod'),
+                           'path': event.get('path')})
+                route_timer.__enter__()
+                try:
+                    if event.get('requestContext', None) and event['requestContext'].get('elb', None):
+                        # Related: https://github.com/Miserlou/Zappa/issues/1715
+                        # inputs/outputs for lambda loadbalancer
+                        # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/lambda-functions.html
+                        is_elb_context = True
+                        # host is lower-case when forwarded from ELB
+                        host = headers.get('host')
+                        # TODO: pathParameters is a first-class citizen in apigateway but not available without
+                        # some parsing work for ELB (is this parameter used for anything?)
+                        event['pathParameters'] = ''
                     else:
-                        host = None
-                    logger.debug('host found: [{}]'.format(host))
-
-                    if host:
-                        if 'amazonaws.com' in host:
-                            logger.debug('amazonaws found in host')
-                            # The path provided in th event doesn't include the
-                            # stage, so we must tell Flask to include the API
-                            # stage in the url it calculates. See https://github.com/Miserlou/Zappa/issues/1014
-                            script_name = '/' + settings.API_STAGE
-                    else:
-                        # This is a test request sent from the AWS console
-                        if settings.DOMAIN:
-                            # Assume the requests received will be on the specified
-                            # domain. No special handling is required
-                            pass
+                        if headers:
+                            host = headers.get('Host')
                         else:
-                            # Assume the requests received will be to the
-                            # amazonaws.com endpoint, so tell Flask to include the
-                            # API stage
-                            script_name = '/' + settings.API_STAGE
+                            host = None
+                        logger.debug('host found: [{}]'.format(host))
 
-                base_path = getattr(settings, 'BASE_PATH', None)
+                        if host:
+                            if 'amazonaws.com' in host:
+                                logger.debug('amazonaws found in host')
+                                # The path provided in th event doesn't include the
+                                # stage, so we must tell Flask to include the API
+                                # stage in the url it calculates. See https://github.com/Miserlou/Zappa/issues/1014
+                                script_name = '/' + settings.API_STAGE
+                        else:
+                            # This is a test request sent from the AWS console
+                            if settings.DOMAIN:
+                                # Assume the requests received will be on the specified
+                                # domain. No special handling is required
+                                pass
+                            else:
+                                # Assume the requests received will be to the
+                                # amazonaws.com endpoint, so tell Flask to include the
+                                # API stage
+                                script_name = '/' + settings.API_STAGE
 
-                # Create the environment for WSGI and handle the request
-                environ = create_wsgi_request(
-                    event,
-                    script_name=script_name,
-                    base_path=base_path,
-                    trailing_slash=self.trailing_slash,
-                    binary_support=settings.BINARY_SUPPORT,
-                    context_header_mappings=settings.CONTEXT_HEADER_MAPPINGS
-                )
+                    base_path = getattr(settings, 'BASE_PATH', None)
 
-                # We are always on https on Lambda, so tell our wsgi app that.
-                environ['HTTPS'] = 'on'
-                environ['wsgi.url_scheme'] = 'https'
-                environ['lambda.context'] = context
-                environ['lambda.event'] = event
+                    # Create the environment for WSGI and handle the request
+                    environ = create_wsgi_request(
+                        event,
+                        script_name=script_name,
+                        base_path=base_path,
+                        trailing_slash=self.trailing_slash,
+                        binary_support=settings.BINARY_SUPPORT,
+                        context_header_mappings=settings.CONTEXT_HEADER_MAPPINGS,
+                        trace_id=trace_id,
+                    )
+
+                    # We are always on https on Lambda, so tell our wsgi app that.
+                    environ['HTTPS'] = 'on'
+                    environ['wsgi.url_scheme'] = 'https'
+                    environ['lambda.context'] = context
+                    environ['lambda.event'] = event
+                    environ[TRACE_ID_WSGI_HTTP_HEADER] = trace_id
+                except Exception:
+                    route_timer.__exit__(*sys.exc_info())
+                    self.metric_reporter.flush()
+                    raise
+                route_timer.__exit__(None, None, None)
 
                 # Execute the application
-                with Response.from_app(self.wsgi_app, environ) as response:
+                wsgi_timer = self._timed(
+                    'wsgi.request', trace_id=trace_id,
+                    dimensions={'route': 'http'},
+                    extra={'method': environ.get('REQUEST_METHOD'),
+                           'path': environ.get('PATH_INFO')})
+                wsgi_timer.__enter__()
+                try:
+                    response_cm = Response.from_app(self.wsgi_app, environ)
+                    response = response_cm.__enter__()
                     # This is the object we're going to return.
                     # Pack the WSGI response into our special dictionary.
                     zappa_returndict = dict()
@@ -573,13 +702,42 @@ class LambdaHandler:
                     delta = time_end - time_start
                     response_time_ms = delta.total_seconds() * 1000
                     response.content = response.data
-                    common_log(environ, response, response_time=response_time_ms)
+                    common_log(environ, response,
+                               response_time=response_time_ms,
+                               trace_id=trace_id)
+
+                    self.metric_reporter.add_metric(
+                        'http.status_code', 1, unit='Count',
+                        dimensions={'route': 'http',
+                                    'status_code': str(response.status_code),
+                                    'method': environ.get('REQUEST_METHOD')})
+                    log_event(logger, 'http.response', trace_id=trace_id,
+                              method=environ.get('REQUEST_METHOD'),
+                              path=environ.get('PATH_INFO'),
+                              status_code=response.status_code,
+                              response_time_ms=round(response_time_ms, 3))
+                    response_cm.__exit__(None, None, None)
+                    wsgi_timer.__exit__(None, None, None)
+                    self.metric_reporter.flush()
 
                     return zappa_returndict
+                except Exception:
+                    wsgi_exc_info = sys.exc_info()
+                    try:
+                        response_cm.__exit__(*wsgi_exc_info)
+                    except Exception:
+                        pass
+                    wsgi_timer.__exit__(*wsgi_exc_info)
+                    self.metric_reporter.flush()
+                    raise
         except Exception as e:  # pragma: no cover
             # Print statements are visible in the logs either way
             print(e)
             exc_info = sys.exc_info()
+            log_event(logger, 'handler.error', level=logging.ERROR,
+                      trace_id=trace_id, error=str(e),
+                      error_type=e.__class__.__name__)
+            self.metric_reporter.flush()
             message = ('An uncaught exception happened while servicing this request. '
                        'You can investigate this with the `zappa tail` command.')
 

@@ -84,6 +84,13 @@ ATTACH_POLICY = """{
         {
             "Effect": "Allow",
             "Action": [
+                "cloudwatch:PutMetricData"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
                 "lambda:InvokeFunction"
             ],
             "Resource": [
@@ -250,7 +257,9 @@ class Zappa:
             runtime='python3.6', # Detected at runtime in CLI
             tags=(),
             endpoint_urls={},
-            xray_tracing=False
+            xray_tracing=False,
+            metrics_enabled=False,
+            metrics_namespace=None,
         ):
         """
         Instantiate this new Zappa instance, loading any custom credentials if necessary.
@@ -288,6 +297,16 @@ class Zappa:
 
         self.endpoint_urls = endpoint_urls
         self.xray_tracing = xray_tracing
+        self.metrics_enabled = metrics_enabled
+
+        from .observability import DEFAULT_NAMESPACE, MetricReporter
+        self._MetricReporter = MetricReporter
+        self._metrics_namespace = metrics_namespace or DEFAULT_NAMESPACE
+        self._metric_reporter = MetricReporter(
+            cloudwatch_client=None,
+            namespace=self._metrics_namespace,
+            enabled=metrics_enabled,
+        )
 
         # Some common invocations, such as DB migrations,
         # can take longer than the default.
@@ -325,10 +344,38 @@ class Zappa:
             self.cognito_client = self.boto_client('cognito-idp')
             self.sts_client = self.boto_client('sts')
 
+            # Attach the real CloudWatch client to the reporter created in
+            # __init__ so deployment metrics can be published. Reporting is
+            # best-effort; a missing permission never breaks a deployment.
+            if self.metrics_enabled:
+                self._metric_reporter.cloudwatch_client = self.cloudwatch
+
         self.tags = tags
         self.cf_template = troposphere.Template()
         self.cf_api_resources = []
         self.cf_parameters = {}
+
+    def _record_deployment(self, operation, elapsed_ms, success,
+                           dimensions=None):
+        """
+        Record the outcome of a deployment operation to CloudWatch.
+
+        Emits a ``DeploymentLatency`` millisecond datum and either a
+        ``DeploymentSuccess`` or ``DeploymentFailure`` count, both tagged
+        with the operation name (``upload_to_s3``, ``update_lambda_function``
+        or ``deploy_api_gateway``). Silently does nothing unless metrics
+        reporting was enabled when the Zappa client was constructed.
+        """
+        reporter = getattr(self, '_metric_reporter', None)
+        if reporter is None:
+            return
+        dims = {'operation': operation}
+        if dimensions:
+            dims.update({k: v for k, v in dimensions.items() if v})
+        reporter.record_latency('DeploymentLatency', elapsed_ms, dimensions=dims)
+        outcome = 'DeploymentSuccess' if success else 'DeploymentFailure'
+        reporter.record_count(outcome, dimensions=dims)
+        reporter.flush()
 
     def configure_boto_session_method_kwargs(self, service, kw):
         """Allow for custom endpoint urls for non-AWS (testing and bootleg cloud) deployments"""
@@ -896,6 +943,16 @@ class Zappa:
         Returns True on success, false on failure.
 
         """
+        upload_started = time.time()
+
+        def _report_upload(success):
+            self._record_deployment(
+                'upload_to_s3',
+                (time.time() - upload_started) * 1000,
+                success,
+                dimensions={'bucket': bucket_name},
+            )
+
         try:
             self.s3_client.head_bucket(Bucket=bucket_name)
         except botocore.exceptions.ClientError:
@@ -920,6 +977,7 @@ class Zappa:
 
         if not os.path.isfile(source_path) or os.stat(source_path).st_size == 0:
             print("Problem with source file {}".format(source_path))
+            _report_upload(False)
             return False
 
         dest_path = os.path.split(source_path)[1]
@@ -945,7 +1003,9 @@ class Zappa:
             raise
         except Exception as e:  # pragma: no cover
             print(e)
+            _report_upload(False)
             return False
+        _report_upload(True)
         return True
 
     def copy_on_s3(self, src_file_name, dst_file_name, bucket_name):
@@ -1101,19 +1161,29 @@ class Zappa:
         """
         print("Updating Lambda function code..")
 
-        kwargs = dict(
-            FunctionName=function_name,
-            Publish=publish
-        )
-        if local_zip:
-            kwargs['ZipFile'] = local_zip
-        else:
-            kwargs['S3Bucket'] = bucket
-            kwargs['S3Key'] = s3_key
+        update_started = time.time()
+        try:
+            kwargs = dict(
+                FunctionName=function_name,
+                Publish=publish
+            )
+            if local_zip:
+                kwargs['ZipFile'] = local_zip
+            else:
+                kwargs['S3Bucket'] = bucket
+                kwargs['S3Key'] = s3_key
 
-        response = self.lambda_client.update_function_code(**kwargs)
-        resource_arn = response['FunctionArn']
-        version = response['Version']
+            response = self.lambda_client.update_function_code(**kwargs)
+            resource_arn = response['FunctionArn']
+            version = response['Version']
+        except Exception:
+            self._record_deployment(
+                'update_lambda_function',
+                (time.time() - update_started) * 1000,
+                False,
+                dimensions={'function_name': function_name},
+            )
+            raise
 
         # If the lambda has an ALB alias, let's update the alias
         # to point to the newest version of the function. We have to use a GET
@@ -1165,6 +1235,12 @@ class Zappa:
             for version in versions_in_lambda[::-1][num_revisions:]:
                 self.lambda_client.delete_function(FunctionName=function_name,Qualifier=version)
 
+        self._record_deployment(
+            'update_lambda_function',
+            (time.time() - update_started) * 1000,
+            True,
+            dimensions={'function_name': function_name},
+        )
         return resource_arn
 
     def update_lambda_configuration(    self,
@@ -1774,31 +1850,47 @@ class Zappa:
         """
         print("Deploying API Gateway..")
 
-        self.apigateway_client.create_deployment(
-            restApiId=api_id,
-            stageName=stage_name,
-            stageDescription=stage_description,
-            description=description,
-            cacheClusterEnabled=cache_cluster_enabled,
-            cacheClusterSize=cache_cluster_size,
-            variables=variables or {}
+        deploy_started = time.time()
+        try:
+            self.apigateway_client.create_deployment(
+                restApiId=api_id,
+                stageName=stage_name,
+                stageDescription=stage_description,
+                description=description,
+                cacheClusterEnabled=cache_cluster_enabled,
+                cacheClusterSize=cache_cluster_size,
+                variables=variables or {}
+            )
+
+            if cloudwatch_log_level not in self.cloudwatch_log_levels:
+                cloudwatch_log_level = 'OFF'
+
+            self.apigateway_client.update_stage(
+                restApiId=api_id,
+                stageName=stage_name,
+                patchOperations=[
+                    self.get_patch_op('logging/loglevel', cloudwatch_log_level),
+                    self.get_patch_op('logging/dataTrace', cloudwatch_data_trace),
+                    self.get_patch_op('metrics/enabled', cloudwatch_metrics_enabled),
+                    self.get_patch_op('caching/ttlInSeconds', str(cache_cluster_ttl)),
+                    self.get_patch_op('caching/dataEncrypted', cache_cluster_encrypted)
+                ]
+            )
+        except Exception:
+            self._record_deployment(
+                'deploy_api_gateway',
+                (time.time() - deploy_started) * 1000,
+                False,
+                dimensions={'api_id': api_id, 'stage': stage_name},
+            )
+            raise
+
+        self._record_deployment(
+            'deploy_api_gateway',
+            (time.time() - deploy_started) * 1000,
+            True,
+            dimensions={'api_id': api_id, 'stage': stage_name},
         )
-
-        if cloudwatch_log_level not in self.cloudwatch_log_levels:
-            cloudwatch_log_level = 'OFF'
-
-        self.apigateway_client.update_stage(
-            restApiId=api_id,
-            stageName=stage_name,
-            patchOperations=[
-                self.get_patch_op('logging/loglevel', cloudwatch_log_level),
-                self.get_patch_op('logging/dataTrace', cloudwatch_data_trace),
-                self.get_patch_op('metrics/enabled', cloudwatch_metrics_enabled),
-                self.get_patch_op('caching/ttlInSeconds', str(cache_cluster_ttl)),
-                self.get_patch_op('caching/dataEncrypted', cache_cluster_encrypted)
-            ]
-        )
-
         return "https://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
 
     def add_binary_support(self, api_id, cors=False):

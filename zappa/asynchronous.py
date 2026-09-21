@@ -170,6 +170,12 @@ class LambdaAsyncResponse:
                 'args': args,
                 'kwargs': kwargs
             }
+        # Propagate the current request trace id so the follow-up Lambda
+        # invocation logs under the same trace as the originating request.
+        trace_id = os.environ.get('ZAPPA_TRACE_ID')
+        if trace_id:
+            message['trace_id'] = trace_id
+        message['command'] = 'zappa.asynchronous.route_lambda_task'
         self._send(message)
         return self
 
@@ -177,7 +183,6 @@ class LambdaAsyncResponse:
         """
         Given a message, directly invoke the lamdba function for this task.
         """
-        message['command'] = 'zappa.asynchronous.route_lambda_task'
         payload = json.dumps(message).encode('utf-8')
         if len(payload) > LAMBDA_ASYNC_PAYLOAD_LIMIT: # pragma: no cover
             raise AsyncException("Payload too large for async Lambda call")
@@ -269,7 +274,7 @@ def route_lambda_task(event, context):
     imports the function, calls the function with args
     """
     message = event
-    return run_message(message)
+    return _run_routed_message(message, service='lambda')
 
 
 def route_sns_task(event, context):
@@ -281,7 +286,37 @@ def route_sns_task(event, context):
     message = json.loads(
             record['Sns']['Message']
         )
-    return run_message(message)
+    return _run_routed_message(message, service='sns')
+
+
+def _run_routed_message(message, service):
+    """
+    Run a routed async task, emitting a structured log entry with the
+    propagated trace id and the wall-clock duration of the task.
+    """
+    import logging
+    import time
+
+    from .observability import log_event
+
+    task_logger = logging.getLogger()
+    trace_id = message.get('trace_id')
+    task_path = message.get('task_path')
+    started = time.time()
+    try:
+        response = run_message(message)
+        log_event(task_logger, 'async.task.complete', trace_id=trace_id,
+                  service=service, task_path=task_path,
+                  duration_ms=round((time.time() - started) * 1000, 3),
+                  outcome='success')
+        return response
+    except Exception as task_exc:
+        log_event(task_logger, 'async.task.complete',
+                  level=logging.ERROR, trace_id=trace_id,
+                  service=service, task_path=task_path,
+                  duration_ms=round((time.time() - started) * 1000, 3),
+                  outcome='failure', error=str(task_exc))
+        raise
 
 
 def run_message(message):

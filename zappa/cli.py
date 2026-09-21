@@ -2102,6 +2102,8 @@ class ZappaCLI:
         self.aws_kms_key_arn = self.stage_config.get('aws_kms_key_arn', '')
         self.context_header_mappings = self.stage_config.get('context_header_mappings', {})
         self.xray_tracing = self.stage_config.get('xray_tracing', False)
+        self.metrics_enabled = self.stage_config.get('metrics_enabled', False)
+        self.metrics_namespace = self.stage_config.get('metrics_namespace', None)
         self.desired_role_arn = self.stage_config.get('role_arn')
         self.layers = self.stage_config.get('layers', None)
 
@@ -2122,7 +2124,9 @@ class ZappaCLI:
                             runtime=self.runtime,
                             tags=self.tags,
                             endpoint_urls=self.stage_config.get('aws_endpoint_urls',{}),
-                            xray_tracing=self.xray_tracing
+                            xray_tracing=self.xray_tracing,
+                            metrics_enabled=self.metrics_enabled,
+                            metrics_namespace=self.metrics_namespace
                         )
 
         for setting in CUSTOM_SETTINGS:
